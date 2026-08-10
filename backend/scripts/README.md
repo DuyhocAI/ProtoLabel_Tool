@@ -131,8 +131,6 @@ python scripts/migrate_and_optimize.py
 ### Step 3: Replace Backend Code
 ```bash
 cd app
-cp main.py main.py.original
-cp main_optimized.py main.py
 cd ../..
 ```
 
@@ -157,7 +155,6 @@ python backend/scripts/benchmark.py
 - [ ] **Test on staging**: Run migration on non-production database first
 - [ ] **Run migration script**: `python scripts/migrate_and_optimize.py`
 - [ ] **Verify results**: `python scripts/benchmark.py` shows speedups
-- [ ] **Swap code**: `cp app/main_optimized.py app/main.py`
 - [ ] **Restart services**: Kill and restart backend server
 - [ ] **Monitor performance**: Use benchmark script to verify improvement
 - [ ] **Keep original code**: Keep `main.py.original` for rollback if needed
@@ -177,7 +174,6 @@ cd ..
 
 # Restore original code
 cd app
-cp main.py.original main.py
 cd ../..
 
 # Restart backend
@@ -279,7 +275,6 @@ sqlite3 data/prot0label.sqlite3 "REINDEX;"
 ## What Changed
 
 ### Files Added
-- ✅ `app/main_optimized.py` - Optimized backend code
 - ✅ `scripts/migrate_and_optimize.py` - Migration helper
 - ✅ `scripts/benchmark.py` - Performance testing
 
@@ -301,7 +296,6 @@ sqlite3 data/prot0label.sqlite3 "REINDEX;"
 
 1. ✅ Run `migrate_and_optimize.py`
 2. ✅ Verify with `benchmark.py`
-3. ✅ Deploy `main_optimized.py`
 4. ✅ Monitor performance in production
 5. ✅ Share feedback!
 
@@ -312,4 +306,3 @@ sqlite3 data/prot0label.sqlite3 "REINDEX;"
 Having issues? Check:
 1. `OPTIMIZATION_GUIDE.md` - Detailed documentation
 2. `benchmark.py` - Run to diagnose performance
-3. `main_optimized.py` - Review code comments

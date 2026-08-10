@@ -5,12 +5,13 @@ Compares original vs optimized database performance.
 
 Usage: python benchmark.py
 """
+import os
 import sqlite3
 import time
 import json
 from pathlib import Path
 
-DB_PATH = Path(__file__).parents[2] / "data" / "prot0label.sqlite3"
+DB_PATH = Path(os.getenv("PROTOLABEL_DB_PATH", Path(__file__).resolve().parents[3] / "data" / "prot0label.sqlite3")).resolve()
 
 def time_query(c, query, params=None, label=""):
     """Execute query and measure time."""

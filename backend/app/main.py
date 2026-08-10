@@ -1,11 +1,15 @@
 """ProtoLabel: local-first dataset labeling and model-assisted review API."""
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
+import logging
 import os
+import secrets
 import sqlite3
 import threading
+import time
 import uuid
 import tempfile
 import zipfile
@@ -14,77 +18,208 @@ from pathlib import Path
 from typing import Any
 
 import cv2
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
+from starlette.responses import JSONResponse
 
 _workspace_root = os.getenv("PROTOLABEL_WORKSPACE_ROOT")
 ROOT = Path(_workspace_root).resolve() if _workspace_root else Path(__file__).resolve().parents[3]
 DATA = Path(os.getenv("PROTOLABEL_DATA_DIR", ROOT / "data")).resolve()
 MODEL_DIR = Path(os.getenv("PROTOLABEL_MODEL_DIR", ROOT / "Protolabel" / "models")).resolve()
 DB = DATA / "prot0label.sqlite3"
-ALLOWED_ROOT = Path(os.getenv("PROTOLABEL_ROOT", "/home/tts02/AI/DuyNAB")).resolve()
+ALLOWED_ROOT = Path(os.getenv("PROTOLABEL_ROOT", ROOT)).resolve()
 EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
-MAX_IMAGES = 100_000
+MAX_UPLOAD_BYTES = int(os.getenv("PROTOLABEL_MAX_UPLOAD_BYTES", str(2 * 1024**3)))
+MAX_UPLOAD_FILES = int(os.getenv("PROTOLABEL_MAX_UPLOAD_FILES", "10000"))
+AUTH_USERNAME = os.getenv("PROTOLABEL_AUTH_USERNAME", "protolabel")
+AUTH_PASSWORD = os.getenv("PROTOLABEL_AUTH_PASSWORD", "")
+JOB_RETENTION_SECONDS = int(os.getenv("PROTOLABEL_JOB_RETENTION_SECONDS", "86400"))
+JOB_DIR = DATA / "jobs"
+logger = logging.getLogger("protolabel")
 
 app = FastAPI(title="ProtoLabel", version="0.1.0")
 # CORS restricted to frontend origin only (security fix)
 ALLOWED_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:8101,http://127.0.0.1:8101").split(",")
-app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_methods=["GET", "POST", "PUT", "DELETE"], allow_headers=["Content-Type"])
-pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="prelabel")
+app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_methods=["GET", "POST", "PUT", "DELETE"], allow_headers=["Content-Type", "Authorization"])
+pool = ThreadPoolExecutor(max_workers=max(2, int(os.getenv("PROTOLABEL_JOB_WORKERS", "2"))), thread_name_prefix="protolabel-job")
 jobs: dict[str, dict[str, Any]] = {}
+jobs_lock = threading.Lock()
+job_last_persisted: dict[str, float] = {}
 model_cache: dict[str, Any] = {}
 model_lock = threading.Lock()
 
 
-def db() -> sqlite3.Connection:
+@app.middleware("http")
+async def require_auth(request: Request, call_next):
+    if request.url.path == "/api/health":
+        return await call_next(request)
+    if not AUTH_PASSWORD:
+        return JSONResponse({"detail": "Server authentication is not configured"}, status_code=503)
+    authorization = request.headers.get("Authorization", "")
+    authenticated = False
+    if authorization.startswith("Basic "):
+        try:
+            decoded = base64.b64decode(authorization[6:], validate=True).decode("utf-8")
+            username, password = decoded.split(":", 1)
+            authenticated = secrets.compare_digest(username, AUTH_USERNAME) and secrets.compare_digest(password, AUTH_PASSWORD)
+        except (ValueError, UnicodeDecodeError):
+            pass
+    if not authenticated:
+        return JSONResponse(
+            {"detail": "Authentication required"},
+            status_code=401,
+            headers={"WWW-Authenticate": "Basic realm=ProtoLabel"},
+        )
+    return await call_next(request)
+
+
+@app.exception_handler(Exception)
+async def unexpected_error(request: Request, exc: Exception):
+    logger.exception("Unhandled request error on %s", request.url.path, exc_info=exc)
+    return JSONResponse({"detail": "Internal server error"}, status_code=500)
+
+
+def init_db() -> None:
     DATA.mkdir(parents=True, exist_ok=True)
     c = sqlite3.connect(DB, timeout=30)
-    c.row_factory = sqlite3.Row
-    c.execute("PRAGMA journal_mode=WAL")
-    c.execute("PRAGMA synchronous=NORMAL")
-    c.executescript("""
+    try:
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA synchronous=NORMAL")
+        c.executescript("""
     CREATE TABLE IF NOT EXISTS projects(
       id TEXT PRIMARY KEY, name TEXT NOT NULL, root TEXT NOT NULL,
       classes TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
     CREATE TABLE IF NOT EXISTS images(
       id TEXT PRIMARY KEY, project_id TEXT NOT NULL, rel_path TEXT NOT NULL,
-      width INTEGER NOT NULL, height INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'unlabeled',
+      width INTEGER NOT NULL, height INTEGER NOT NULL, status TEXT NOT NULL DEFAULT "unlabeled",
       UNIQUE(project_id, rel_path)
     );
     CREATE TABLE IF NOT EXISTS boxes(
       id TEXT PRIMARY KEY, image_id TEXT NOT NULL, cls_name TEXT NOT NULL,
       x1 REAL NOT NULL, y1 REAL NOT NULL, x2 REAL NOT NULL, y2 REAL NOT NULL,
-      confidence REAL, source TEXT NOT NULL DEFAULT 'manual', attrs TEXT NOT NULL DEFAULT '{}'
+      confidence REAL, source TEXT NOT NULL DEFAULT "manual", attrs TEXT NOT NULL DEFAULT "{}"
     );
     CREATE INDEX IF NOT EXISTS image_project_status ON images(project_id,status,rel_path);
     CREATE INDEX IF NOT EXISTS box_image ON boxes(image_id);
     CREATE TABLE IF NOT EXISTS app_metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-    """)
-    c.execute("BEGIN IMMEDIATE")
-    convention = c.execute("SELECT value FROM app_metadata WHERE key=?", ("bbox_coordinate_system",)).fetchone()
-    if convention is None:
-        c.execute("UPDATE boxes SET y1=1.0-y2, y2=1.0-y1")
-        c.execute("INSERT INTO app_metadata(key,value) VALUES(?,?)", ("bbox_coordinate_system", "normalized_bottom_left_v1"))
-    c.commit()
+        """)
+        convention = c.execute("SELECT value FROM app_metadata WHERE key=?", ("bbox_coordinate_system",)).fetchone()
+        if convention is None:
+            box_count = c.execute("SELECT COUNT(*) FROM boxes").fetchone()[0]
+            if box_count:
+                raise RuntimeError(
+                    "Database has boxes but no bbox_coordinate_system marker. "
+                    "Refusing to mutate coordinates automatically; restore metadata or run an explicit migration."
+                )
+            c.execute("INSERT INTO app_metadata(key,value) VALUES(?,?)", ("bbox_coordinate_system", "normalized_bottom_left_v1"))
+        c.commit()
+    finally:
+        c.close()
+
+
+@app.on_event("startup")
+def startup() -> None:
+    if not AUTH_PASSWORD:
+        logger.error("PROTOLABEL_AUTH_PASSWORD is not configured; protected endpoints will return 503")
+    init_db()
+    load_jobs()
+
+
+def db() -> sqlite3.Connection:
+    c = sqlite3.connect(DB, timeout=30)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA foreign_keys=ON")
     return c
 
 
+def persist_job_locked(jid: str, force: bool = False) -> None:
+    now = time.time()
+    if not force and now - job_last_persisted.get(jid, 0) < 1.0:
+        return
+    JOB_DIR.mkdir(parents=True, exist_ok=True)
+    destination = JOB_DIR / f"{jid}.json"
+    temporary = JOB_DIR / f".{jid}.{uuid.uuid4().hex}.tmp"
+    temporary.write_text(jsons(jobs[jid]), encoding="utf-8")
+    temporary.replace(destination)
+    job_last_persisted[jid] = now
+
+
+def load_jobs() -> None:
+    JOB_DIR.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    with jobs_lock:
+        for path in JOB_DIR.glob("*.json"):
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+                if now - float(value.get("updated_at", now)) > JOB_RETENTION_SECONDS:
+                    path.unlink(missing_ok=True)
+                    continue
+                if value.get("status") in {"queued", "running"}:
+                    value.update(status="error", error="Job interrupted by backend restart", updated_at=now)
+                jid = str(value["id"])
+                jobs[jid] = value
+                persist_job_locked(jid, force=True)
+            except Exception:
+                logger.exception("Ignoring invalid job journal %s", path.name)
+
+
+def create_job(kind: str, **values: Any) -> dict[str, Any]:
+    now = time.time()
+    with jobs_lock:
+        expired = [key for key, value in jobs.items() if value.get("status") in {"done", "error", "cancelled"} and now - value.get("updated_at", now) > JOB_RETENTION_SECONDS]
+        for key in expired:
+            jobs.pop(key, None)
+            job_last_persisted.pop(key, None)
+            (JOB_DIR / f"{key}.json").unlink(missing_ok=True)
+        jid = uuid.uuid4().hex[:12]
+        jobs[jid] = {"id": jid, "kind": kind, "status": "queued", "created_at": now, "updated_at": now, **values}
+        persist_job_locked(jid, force=True)
+        return jobs[jid]
+
+
+def update_job(jid: str, **values: Any) -> None:
+    with jobs_lock:
+        if jid in jobs:
+            jobs[jid].update(updated_at=time.time(), **values)
+            persist_job_locked(jid, force=jobs[jid].get("status") in {"done", "error", "cancelled"})
+
 def jsons(v: Any) -> str:
     return json.dumps(v, ensure_ascii=False, separators=(",", ":"))
+
+
+def numeric_field(payload: dict[str, Any], name: str, default: float, minimum: float, maximum: float) -> float:
+    try:
+        value = float(payload.get(name, default))
+    except (TypeError, ValueError):
+        raise HTTPException(422, f"{name} must be numeric")
+    if not minimum <= value <= maximum:
+        raise HTTPException(422, f"{name} must be between {minimum} and {maximum}")
+    return value
+
+
+def integer_field(payload: dict[str, Any], name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(payload.get(name, default))
+    except (TypeError, ValueError):
+        raise HTTPException(422, f"{name} must be an integer")
+    if not minimum <= value <= maximum:
+        raise HTTPException(422, f"{name} must be between {minimum} and {maximum}")
+    return value
 
 
 def safe_root(raw: str) -> Path:
     # Security: prevent path traversal and access outside allowed root
     p = Path(raw).expanduser().resolve()
     if not p.is_dir():
-        raise HTTPException(400, f"Directory not found: {p}")
+        raise HTTPException(400, "Directory not found or inaccessible")
     # Strict check: path must be exactly ALLOWED_ROOT or a direct child/descendant
     try:
         p.relative_to(ALLOWED_ROOT)  # Will raise ValueError if not relative
     except ValueError:
-        raise HTTPException(403, f"Path must be within {ALLOWED_ROOT}")
+        raise HTTPException(403, "Path is outside the configured workspace")
     return p
 
 
@@ -112,8 +247,8 @@ def runtime_info() -> dict[str, Any]:
             info["device"] = f"cuda:{index}"
             info["gpu_name"] = torch.cuda.get_device_name(index)
             info["gpu_memory_gb"] = round(torch.cuda.get_device_properties(index).total_memory / 2**30, 2)
-    except Exception as exc:
-        info["error"] = str(exc)
+    except Exception:
+        logger.exception("Unable to inspect runtime device")
     return info
 
 
@@ -171,14 +306,15 @@ def delete_project(pid: str):
         return {"status": "ok", "message": f"Project {pid} deleted"}
     except Exception as exc:
         c.close()
-        raise HTTPException(400, f"Delete failed: {str(exc)}")
+        logger.exception("Project deletion failed")
+        raise HTTPException(500, "Project deletion failed")
 
 
 def _scan_project_job(jid: str, root: Path, name: str, classes: list[str]):
-    jobs[jid].update(status="running", stage="discovering", detail="Đang tìm file ảnh…")
+    update_job(jid, status="running", stage="discovering", detail="Đang tìm file ảnh…")
     try:
-        files = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in EXTS][:MAX_IMAGES]
-        jobs[jid].update(stage="indexing", total=len(files), processed=0, detail=f"Đã tìm thấy {len(files):,} file; đang đọc metadata…")
+        files = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in EXTS]
+        update_job(jid, stage="indexing", total=len(files), processed=0, detail=f"Đã tìm thấy {len(files):,} file; đang đọc metadata…")
         pid = uuid.uuid4().hex[:12]
         c = db()
         c.execute("INSERT INTO projects(id,name,root,classes) VALUES(?,?,?,?)", (pid, name[:100], str(root), jsons(classes)))
@@ -191,11 +327,11 @@ def _scan_project_job(jid: str, root: Path, name: str, classes: list[str]):
                 iid = hashlib.sha1(f"{pid}:{rel}".encode()).hexdigest()[:20]
                 c.execute("INSERT OR IGNORE INTO images VALUES(?,?,?,?,?,?)", (iid, pid, rel, int(w), int(h), "unlabeled"))
                 count += 1
-            jobs[jid].update(processed=n, detail=f"Đọc metadata {n:,}/{len(files):,}")
+            update_job(jid, processed=n, detail=f"Đọc metadata {n:,}/{len(files):,}")
         c.commit(); c.close()
-        jobs[jid].update(status="done", stage="complete", project_id=pid, image_count=count, root=str(root), name=name, detail=f"Đã lập chỉ mục {count:,} ảnh")
+        update_job(jid, status="done", stage="complete", project_id=pid, image_count=count, root=str(root), name=name, detail=f"Đã lập chỉ mục {count:,} ảnh")
     except Exception as exc:
-        jobs[jid].update(status="error", error=str(exc), detail="Không thể quét thư mục")
+        update_job(jid, status="error", error="Project scan failed", detail="Không thể quét thư mục")
 
 
 @app.post("/api/projects")
@@ -206,8 +342,13 @@ def create_project(payload: dict[str, Any]):
     if not classes or not isinstance(classes, list) or not all(isinstance(c, str) for c in classes):
         classes = ["object"]  # Minimal default instead of PPE-specific
     name = str(payload.get("name") or root.name)[:100]
-    jid = uuid.uuid4().hex[:12]
-    jobs[jid] = {"id": jid, "kind": "project_scan", "status": "queued", "stage": "queued", "processed": 0, "total": 0, "error": None, "detail": "Đang xếp hàng quét dữ liệu…", "name": name, "root": str(root)}
+    c = db()
+    duplicate = c.execute("SELECT id FROM projects WHERE root=? LIMIT 1", (str(root),)).fetchone()
+    c.close()
+    if duplicate:
+        raise HTTPException(409, "A project already exists for this directory")
+    job_data = create_job("project_scan", stage="queued", processed=0, total=0, error=None, detail="Đang xếp hàng quét dữ liệu…", name=name, root=str(root))
+    jid = job_data["id"]
     pool.submit(_scan_project_job, jid, root, name, classes)
     return jobs[jid]
 
@@ -217,6 +358,11 @@ async def upload_project(files: list[UploadFile] = File(...), name: str = ""):
     """Upload a browser-selected folder, then index it as a normal project."""
     if not files:
         raise HTTPException(400, "Chưa chọn thư mục ảnh")
+    if len(files) > MAX_UPLOAD_FILES:
+        raise HTTPException(413, f"Folder upload is limited to {MAX_UPLOAD_FILES:,} files")
+    declared_bytes = sum(int(file.size or 0) for file in files)
+    if declared_bytes > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, f"Folder upload is limited to {MAX_UPLOAD_BYTES / 1024**3:.1f} GiB")
     upload_root = DATA / "dataset_uploads" / uuid.uuid4().hex[:12]
     upload_root.mkdir(parents=True, exist_ok=True)
     total_bytes = 0
@@ -235,9 +381,12 @@ async def upload_project(files: list[UploadFile] = File(...), name: str = ""):
             with destination.open("wb") as handle:
                 while chunk := await file.read(4 * 1024 * 1024):
                     total_bytes += len(chunk)
-                    if total_bytes > 20 * 1024**3:
-                        raise HTTPException(413, "Folder upload tối đa 20GB")
+                    if total_bytes > MAX_UPLOAD_BYTES:
+                        raise HTTPException(413, f"Folder upload is limited to {MAX_UPLOAD_BYTES / 1024**3:.1f} GiB")
                     handle.write(chunk)
+            if cv2.imread(str(destination), cv2.IMREAD_UNCHANGED) is None:
+                destination.unlink(missing_ok=True)
+                continue
             saved += 1
     except Exception:
         import shutil
@@ -248,10 +397,10 @@ async def upload_project(files: list[UploadFile] = File(...), name: str = ""):
         shutil.rmtree(upload_root, ignore_errors=True)
         raise HTTPException(400, "Thư mục không có file ảnh hỗ trợ")
     name = name.strip() or upload_root.name
-    jid = uuid.uuid4().hex[:12]
-    jobs[jid] = {"id": jid, "kind": "project_scan", "status": "queued", "stage": "queued", "processed": 0, "total": 0, "error": None, "detail": f"Đã upload {saved:,} file; đang xếp hàng quét…", "name": name, "root": str(upload_root), "uploaded_files": saved, "uploaded_bytes": total_bytes}
+    job_data = create_job("project_scan", stage="queued", processed=0, total=0, error=None, detail=f"Đã upload {saved:,} file; đang xếp hàng quét…", name=name, root=str(upload_root), uploaded_files=saved, uploaded_bytes=total_bytes)
+    jid = job_data["id"]
     pool.submit(_scan_project_job, jid, upload_root, name, ["person", "helmet", "glasses", "gloves", "shoes", "safety-vest"])
-    return jobs[jid]
+    return job_data
 
 
 @app.get("/api/projects/{pid}")
@@ -378,7 +527,7 @@ def predict(model_id: str, path: Path, conf: float, iou: float, device: str | No
 
 
 def prelabel_job(job_id: str, pid: str, ids: list[str], model_id: str, conf: float, iou: float, replace: bool, device: str | None):
-    jobs[job_id]["status"] = "running"; c = db()
+    update_job(job_id, status="running"); c = db()
     try:
         p = get_project(c, pid); root = Path(p["root"])
         for n, iid in enumerate(ids, 1):
@@ -387,29 +536,47 @@ def prelabel_job(job_id: str, pid: str, ids: list[str], model_id: str, conf: flo
             try:
                 boxes = predict(model_id, (root / row["rel_path"]).resolve(), conf, iou, device)
                 c.execute("BEGIN IMMEDIATE")
-                if replace: c.execute("DELETE FROM boxes WHERE image_id=?", (iid,))
+                if replace: c.execute("DELETE FROM boxes WHERE image_id=? AND source!=?", (iid, "manual"))
                 for a in boxes:
                     b=a["bbox"]; c.execute("INSERT INTO boxes VALUES(?,?,?,?,?,?,?,?,?,?)", (a["id"],iid,a["cls_name"],*b,a["confidence"],a["source"],jsons(a["attributes"])))
                 c.execute("UPDATE images SET status='review' WHERE id=?", (iid,))
                 c.commit()
             except Exception as e:
                 c.execute("ROLLBACK")
-                jobs[job_id]["error"] = f"Image {iid}: {str(e)}"
+                update_job(job_id, error=f"Image {iid} failed")
                 raise
-            jobs[job_id]["processed"] = n
-        jobs[job_id]["status"] = "done"
-    except Exception as exc: jobs[job_id].update(status="error", error=f"Prelabel failed: {str(exc)}")
+            update_job(job_id, processed=n)
+        update_job(job_id, status="done")
+    except Exception:
+        update_job(job_id, status="error", error="Prelabel failed; check backend logs")
     finally: c.close()
 
 
 @app.post("/api/projects/{pid}/prelabel")
 def start_prelabel(pid: str, payload: dict[str, Any]):
-    c = db(); get_project(c, pid)
-    ids = payload.get("image_ids") or [r["id"] for r in c.execute("SELECT id FROM images WHERE project_id=? AND status!='labeled' ORDER BY rel_path", (pid,)).fetchall()]; c.close()
-    if not ids: raise HTTPException(400, "Không có ảnh để prelabel")
-    jid = uuid.uuid4().hex[:12]; jobs[jid] = {"id": jid, "status": "queued", "processed": 0, "total": len(ids), "error": None, "device": resolve_device(payload.get("device"))}
-    pool.submit(prelabel_job, jid, pid, ids, str(payload.get("model_id", "yolo26n")), float(payload.get("conf", .25)), float(payload.get("iou", .7)), bool(payload.get("replace", True)), payload.get("device"))
-    return jobs[jid]
+    c = db()
+    get_project(c, pid)
+    requested_ids = payload.get("image_ids")
+    if requested_ids is not None and (not isinstance(requested_ids, list) or not all(isinstance(value, str) for value in requested_ids)):
+        c.close()
+        raise HTTPException(422, "image_ids must be a list of strings")
+    if requested_ids:
+        placeholders = ",".join("?" for _ in requested_ids)
+        ids = [row["id"] for row in c.execute(f"SELECT id FROM images WHERE project_id=? AND id IN ({placeholders})", [pid, *requested_ids]).fetchall()]
+    else:
+        ids = [row["id"] for row in c.execute("SELECT id FROM images WHERE project_id=? AND status <> ? ORDER BY rel_path", (pid, "labeled")).fetchall()]
+    c.close()
+    if not ids:
+        raise HTTPException(400, "Không có ảnh để prelabel")
+    conf = numeric_field(payload, "conf", .25, .01, 1.0)
+    iou = numeric_field(payload, "iou", .7, .01, 1.0)
+    model_id = str(payload.get("model_id", "yolo26n"))
+    models_by_id = {item["id"]: item for item in model_options()}
+    if model_id not in models_by_id or not models_by_id[model_id]["available"]:
+        raise HTTPException(422, "Selected checkpoint is unavailable")
+    job_data = create_job("prelabel", processed=0, total=len(ids), error=None, device=resolve_device(payload.get("device")))
+    pool.submit(prelabel_job, job_data["id"], pid, ids, model_id, conf, iou, bool(payload.get("replace", True)), payload.get("device"))
+    return job_data
 
 
 @app.get("/api/jobs/{jid}")
@@ -420,18 +587,18 @@ def job(jid: str):
 
 
 def _video_project_job(jid: str, video_path: str, name: str, target_frames: int):
-    jobs[jid]["status"] = "running"
+    update_job(jid, status="running")
     cap = cv2.VideoCapture(video_path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
     if total <= 0:
         error_msg = f"Cannot read video: frame_count={total}, fps={fps}. File may be corrupted."
-        jobs[jid].update(status="error", error=error_msg)
+        update_job(jid, status="error", error="Video metadata is invalid")
         cap.release()
         return
     if fps <= 0:
         error_msg = f"Invalid FPS: {fps}. Video file may be corrupted."
-        jobs[jid].update(status="error", error=error_msg)
+        update_job(jid, status="error", error="Video metadata is invalid")
         cap.release()
         return
     count = total if target_frames <= 0 else min(total, target_frames)
@@ -454,7 +621,7 @@ def _video_project_job(jid: str, video_path: str, name: str, target_frames: int)
                 iid = hashlib.sha1(f"{pid}:{filename}".encode()).hexdigest()[:20]
                 c.execute("INSERT INTO images VALUES(?,?,?,?,?,?)", (iid, pid, filename, int(w), int(h), "unlabeled"))
                 saved += 1
-                jobs[jid]["processed"] = saved
+                update_job(jid, processed=saved)
 
         # Seeking tránh giải mã hàng trăm nghìn frame khi người dùng chỉ cần
         # vài chục/vài trăm frame. Với sampling dày, đọc tuần tự nhanh hơn.
@@ -479,10 +646,11 @@ def _video_project_job(jid: str, video_path: str, name: str, target_frames: int)
                     wanted.remove(frame_no)
                 frame_no += 1
         c.commit()
-        jobs[jid].update(status="done", project_id=pid, total=saved, source=video_path, fps=fps, source_frames=total)
+        update_job(jid, status="done", project_id=pid, total=saved, source=video_path, fps=fps, source_frames=total)
     except Exception as exc:
         c.rollback()
-        jobs[jid].update(status="error", error=str(exc))
+        logger.exception("Video project job failed")
+        update_job(jid, status="error", error="Video processing failed; check backend logs")
     finally:
         cap.release()
         c.close()
@@ -502,10 +670,9 @@ def _enqueue_video(video: Path, name: str, target: int):
     if target < 0 or target > 1_000_000:
         raise HTTPException(400, "target_frames phải từ 0 đến 1.000.000; 0 = lấy toàn bộ frame")
     target = min(total, target) if target else total
-    jid = uuid.uuid4().hex[:12]
-    jobs[jid] = {"id": jid, "status": "queued", "processed": 0, "total": target, "error": None, "source_frames": total, "fps": fps}
-    pool.submit(_video_project_job, jid, str(video), name or video.stem, target)
-    return jobs[jid]
+    job_data = create_job("video", processed=0, total=target, error=None, source_frames=total, fps=fps)
+    pool.submit(_video_project_job, job_data["id"], str(video), name or video.stem, target)
+    return job_data
 
 
 @app.post("/api/video-projects")
@@ -515,7 +682,8 @@ def start_video_project(payload: dict[str, Any]):
     video = (safe_root(str(raw_path.parent)) / raw_path.name).resolve()
     if not video.is_file() or video.suffix.lower() not in {".mp4", ".avi", ".mov", ".mkv", ".webm"}:
         raise HTTPException(400, "Video không tồn tại hoặc định dạng không hỗ trợ")
-    return _enqueue_video(video, str(payload.get("name") or video.stem), int(payload.get("target_frames") or 0))
+    target = integer_field(payload, "target_frames", 0, 0, 1_000_000)
+    return _enqueue_video(video, str(payload.get("name") or video.stem), target)
 
 
 @app.post("/api/video-projects/upload")
@@ -533,13 +701,13 @@ async def upload_video_project(file: UploadFile = File(...), target_frames: int 
         with dst.open("wb") as handle:
             while chunk := await file.read(4 * 1024 * 1024):
                 size += len(chunk)
-                if size > 20 * 1024**3:
-                    raise HTTPException(413, "Video upload tối đa 20GB")
+                if size > MAX_UPLOAD_BYTES:
+                    raise HTTPException(413, f"Video upload is limited to {MAX_UPLOAD_BYTES / 1024**3:.1f} GiB")
                 handle.write(chunk)
     except Exception:
         dst.unlink(missing_ok=True)
         raise
-    return _enqueue_video(dst, name or Path(filename).stem, int(target_frames or 0))
+    return _enqueue_video(dst, name or Path(filename).stem, target_frames)
 
 
 @app.get("/api/projects/{pid}/export")
@@ -565,4 +733,4 @@ def export_project(pid: str, format: str = "yolo"):
                     lines.append(f"{classes.index(b['cls_name'])} {cx:.6f} {cy:.6f} {(b['x2']-b['x1']):.6f} {(b['y2']-b['y1']):.6f}")
                 z.writestr(f"labels/{Path(row['rel_path']).with_suffix('.txt')}", "\n".join(lines) + ("\n" if lines else ""))
     c.close()
-    return FileResponse(out, media_type="application/zip", filename=f"{p['name']}-{format}.zip")
+    return FileResponse(out, media_type="application/zip", filename=f"{p['name']}-{format}.zip", background=BackgroundTask(out.unlink, missing_ok=True))

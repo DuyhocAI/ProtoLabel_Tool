@@ -4,20 +4,25 @@ services:
       context: .
       dockerfile: Dockerfile.backend
     restart: unless-stopped
+    user: "${PROTOLABEL_UID:-1000}:${PROTOLABEL_GID:-1000}"
     environment:
-      PROTOLABEL_WORKSPACE_ROOT: /home/tts02/AI/DuyNAB
-      PROTOLABEL_DATA_DIR: /home/tts02/AI/DuyNAB/data
+      PROTOLABEL_WORKSPACE_ROOT: /workspace
+      PROTOLABEL_DATA_DIR: /workspace/data
       PROTOLABEL_MODEL_DIR: /models
-      PROTOLABEL_ROOT: /home/tts02/AI/DuyNAB
+      PROTOLABEL_ROOT: /workspace
+      PROTOLABEL_AUTH_USERNAME: ${PROTOLABEL_AUTH_USERNAME:-protolabel}
+      PROTOLABEL_AUTH_PASSWORD: ${PROTOLABEL_AUTH_PASSWORD:?Set PROTOLABEL_AUTH_PASSWORD in .env}
+      PROTOLABEL_JOB_WORKERS: ${PROTOLABEL_JOB_WORKERS:-2}
+      PROTOLABEL_MAX_UPLOAD_BYTES: ${PROTOLABEL_MAX_UPLOAD_BYTES:-2147483648}
       CORS_ORIGINS: http://localhost:8101,http://127.0.0.1:8101
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
     volumes:
-      - ${PROTOLABEL_HOST_WORKSPACE:-/home/tts02/AI/DuyNAB}:/home/tts02/AI/DuyNAB
+      - ${PROTOLABEL_HOST_WORKSPACE:-..}:/workspace
       - ./models:/models:ro
     gpus: all
-    ports:
-      - "8100:8100"
+    expose:
+      - "8100"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8100/api/health"]
       interval: 30s

@@ -9,11 +9,12 @@ This script:
 
 Usage: python migrate_and_optimize.py
 """
+import os
 import sqlite3
 import sys
 from pathlib import Path
 
-DB_PATH = Path(__file__).parents[2] / "data" / "prot0label.sqlite3"
+DB_PATH = Path(os.getenv("PROTOLABEL_DB_PATH", Path(__file__).resolve().parents[3] / "data" / "prot0label.sqlite3")).resolve()
 
 def migrate():
     if not DB_PATH.exists():
@@ -130,6 +131,7 @@ def migrate():
 
         # Step 6: Optimize database
         print("\n6️⃣  Optimizing database...")
+        c.commit()
         c.execute("VACUUM")
         c.execute("ANALYZE")
         print("   ✅ Database optimized")
@@ -137,9 +139,9 @@ def migrate():
         c.commit()
         print("\n✅ Migration complete! Your database is now optimized.")
         print("\nNext steps:")
-        print("1. Replace backend/app/main.py with main_optimized.py")
-        print("2. Restart the backend server")
-        print("3. Enjoy 10-100x faster performance! 🚀")
+        print("1. Restart the backend server")
+        print("2. Run the benchmark to verify indexes")
+        print("3. Keep a verified database backup")
 
         return True
 

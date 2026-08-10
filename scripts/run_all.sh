@@ -7,11 +7,21 @@ set -Eeuo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BACKEND_DIR="$ROOT_DIR/backend"
 FRONTEND_DIR="$ROOT_DIR/frontend"
-HOST="${PROTOLABEL_HOST:-0.0.0.0}"
+FRONTEND_HOST="${PROTOLABEL_HOST:-0.0.0.0}"
+BACKEND_HOST="${PROTOLABEL_BACKEND_HOST:-127.0.0.1}"
 BACKEND_PORT="${BACKEND_PORT:-8100}"
 FRONTEND_PORT="${FRONTEND_PORT:-8101}"
 LOG_DIR="${PROTOLABEL_LOG_DIR:-$ROOT_DIR/logs}"
 mkdir -p "$LOG_DIR"
+
+if [[ -f "$ROOT_DIR/.env" ]]; then
+  set -a
+  source "$ROOT_DIR/.env"
+  set +a
+fi
+if [[ -z "${PROTOLABEL_AUTH_PASSWORD:-}" ]]; then
+  echo "[ProtoLabel] Thiếu PROTOLABEL_AUTH_PASSWORD trong .env" >&2; exit 1
+fi
 
 # 0.0.0.0 chỉ dùng để bind server. Người dùng phải mở bằng IP LAN thật.
 LAN_IPS=""
@@ -42,7 +52,7 @@ if [[ ! -d "$FRONTEND_DIR/node_modules" ]]; then
   (cd "$FRONTEND_DIR" && npm install)
 fi
 
-echo "[ProtoLabel] Bind    : $HOST"
+echo "[ProtoLabel] Frontend bind: $FRONTEND_HOST"
 echo "[ProtoLabel] Backend : http://127.0.0.1:$BACKEND_PORT (API nội bộ)"
 echo "[ProtoLabel] Logs    : $LOG_DIR"
 if [[ -n "$LAN_IPS" ]]; then
@@ -55,13 +65,13 @@ fi
 
 (
   cd "$BACKEND_DIR"
-  exec "${PYTHON_CMD[@]}" -m uvicorn app.main:app --host "$HOST" --port "$BACKEND_PORT"
+  exec "${PYTHON_CMD[@]}" -m uvicorn app.main:app --host "$BACKEND_HOST" --port "$BACKEND_PORT"
 ) >"$LOG_DIR/backend.log" 2>&1 &
 BACKEND_PID=$!
 
 (
   cd "$FRONTEND_DIR"
-  exec npm run dev -- --host "$HOST" --port "$FRONTEND_PORT"
+  exec npm run dev -- --host "$FRONTEND_HOST" --port "$FRONTEND_PORT"
 ) >"$LOG_DIR/frontend.log" 2>&1 &
 FRONTEND_PID=$!
 
