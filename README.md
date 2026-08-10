@@ -83,7 +83,17 @@ inference model chạy trên GPU.
 
 ## Model registry
 
-ProtoLabel chỉ hiển thị họ YOLO26: `yolo26n`, `yolo26s`, `yolo26m`, `yolo26l`, `yolo26x`. Toàn bộ checkpoint chính thức của Ultralytics được đặt tập trung trong `Protolabel/models` và đều sẵn sàng sử dụng. Có thể thêm model bằng cách sửa `model_options()` trong `backend/app/main.py`. Model được nạp lazy và cache một lần.
+ProtoLabel chỉ hiển thị họ YOLO26: `yolo26n`, `yolo26s`, `yolo26m`, `yolo26l`, `yolo26x`. Checkpoint không được lưu trong Git vì có dung lượng lớn. Sau khi clone repository và cài dependency backend, tải đủ model chính thức của Ultralytics bằng:
+
+```bash
+cd /home/tts02/AI/DuyNAB/Protolabel
+conda activate sgdetr
+python scripts/download_models.py
+```
+
+Script tự tạo `models/`, bỏ qua file đã có và tải các checkpoint còn thiếu. Dùng `python scripts/download_models.py --force` nếu cần tải lại toàn bộ. Có thể dùng thư mục khác với `--model-dir /duong/dan/models` và đặt `PROTOLABEL_MODEL_DIR` trùng với đường dẫn đó khi chạy backend.
+
+Sau khi tải xong, checkpoint nằm trong `Protolabel/models` và sẵn sàng cho prelabel. Model được backend nạp lazy và cache một lần.
 
 ## Dữ liệu và license
 
@@ -103,6 +113,7 @@ Docker package gồm backend FastAPI có Ultralytics/PyTorch và frontend produc
 ```bash
 cd /home/tts02/AI/DuyNAB/Protolabel
 cp -n .env.example .env
+python scripts/download_models.py
 sudo docker compose build
 sudo docker compose up -d
 sudo docker compose ps
