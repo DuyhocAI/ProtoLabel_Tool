@@ -23,6 +23,7 @@ DATA = Path(os.getenv("PROTOLABEL_DATA_DIR", ROOT / "data")).resolve()
 DB = DATA / "prot0label.sqlite3"
 SESSION_COOKIE = "protolabel_session"
 SESSION_TTL = int(os.getenv("PROTOLABEL_SESSION_TTL_SECONDS", str(7 * 86400)))
+ACTIVE_SESSION_CAP_SECONDS = int(os.getenv("PROTOLABEL_ACTIVE_SESSION_CAP_SECONDS", "900"))
 COOKIE_SECURE = os.getenv("PROTOLABEL_COOKIE_SECURE", "false").lower() == "true"
 PUBLIC_PATHS = {"/api/health", "/api/auth/login", "/api/auth/register"}
 USERNAME_RE = re.compile(r"^[a-zA-Z0-9_.-]{3,32}$")
@@ -77,6 +78,7 @@ def init_auth_schema() -> None:
           created_at REAL NOT NULL
         );
         CREATE INDEX IF NOT EXISTS user_events_user_time ON user_events(user_id,created_at);
+        CREATE INDEX IF NOT EXISTS user_events_project_time ON user_events(project_id,created_at);
         CREATE TABLE IF NOT EXISTS image_activity(
           user_id TEXT NOT NULL, image_id TEXT NOT NULL, opened_at REAL NOT NULL,
           PRIMARY KEY(user_id,image_id)
@@ -242,6 +244,7 @@ def change_password(request: Request, payload: dict[str, Any]):
 
 def record_image_open(user_id: str, image_id: str) -> None:
     connection = db()
+    connection.execute("DELETE FROM image_activity WHERE user_id=? AND image_id<>?", (user_id, image_id))
     connection.execute("INSERT INTO image_activity(user_id,image_id,opened_at) VALUES(?,?,?) ON CONFLICT(user_id,image_id) DO UPDATE SET opened_at=excluded.opened_at", (user_id, image_id, time.time()))
     connection.commit(); connection.close()
 
@@ -250,24 +253,43 @@ def record_event(user_id: str, event_type: str, project_id: str | None = None, i
     connection = db(); elapsed = 0.0
     if track_elapsed and image_id:
         opened = connection.execute("SELECT opened_at FROM image_activity WHERE user_id=? AND image_id=?", (user_id, image_id)).fetchone()
-        if opened: elapsed = max(0.0, min(7200.0, time.time() - opened["opened_at"]))
+        if opened: elapsed = max(0.0, min(float(ACTIVE_SESSION_CAP_SECONDS), time.time() - opened["opened_at"]))
         connection.execute("DELETE FROM image_activity WHERE user_id=? AND image_id=?", (user_id, image_id))
     connection.execute("INSERT INTO user_events(user_id,event_type,project_id,image_id,value,elapsed_seconds,created_at) VALUES(?,?,?,?,?,?,?)", (user_id, event_type, project_id, image_id, int(value), elapsed, time.time()))
     connection.commit(); connection.close()
 
 
-def _performance_rows(connection: sqlite3.Connection, user_id: str | None = None):
-    where, args = ("WHERE u.id=?", [user_id]) if user_id else ("", [])
-    return connection.execute(f"""SELECT u.id,u.username,u.display_name,u.role,u.active,u.must_change_password,u.created_at,
-      COALESCE(SUM(CASE WHEN e.event_type='image_save' THEN 1 ELSE 0 END),0) images_saved,
-      COALESCE(SUM(CASE WHEN e.event_type='image_save' THEN e.value ELSE 0 END),0) boxes_saved,
-      COALESCE(SUM(CASE WHEN e.event_type='prelabel_start' THEN 1 ELSE 0 END),0) prelabel_runs,
-      COALESCE(SUM(CASE WHEN e.event_type='prelabel_start' THEN e.value ELSE 0 END),0) prelabel_images,
-      COALESCE(SUM(e.elapsed_seconds),0) active_seconds,
-      MAX(e.created_at) last_active
-      FROM users u LEFT JOIN user_events e ON e.user_id=u.id {where}
-      GROUP BY u.id ORDER BY images_saved DESC,u.username""", args).fetchall()
-
+def _performance_rows(connection: sqlite3.Connection, user_id: str | None = None,
+                      project_id: str | None = None, date_from: float | None = None,
+                      date_to: float | None = None):
+    user_where, user_args = ("WHERE u.id=?", [user_id]) if user_id else ("", [])
+    filter_args = [project_id, project_id, date_from, date_from, date_to, date_to]
+    return connection.execute(f"""
+      WITH filtered_events AS (
+        SELECT * FROM user_events
+        WHERE (? IS NULL OR project_id=?)
+          AND (? IS NULL OR created_at>=?) AND (? IS NULL OR created_at<?)
+      ), latest_saves AS (
+        SELECT user_id,image_id,MAX(id) event_id FROM filtered_events
+        WHERE event_type='image_save' AND image_id IS NOT NULL GROUP BY user_id,image_id
+      ), save_totals AS (
+        SELECT ls.user_id,COUNT(*) images_saved,COALESCE(SUM(e.value),0) boxes_saved
+        FROM latest_saves ls JOIN user_events e ON e.id=ls.event_id GROUP BY ls.user_id
+      ), event_totals AS (
+        SELECT user_id,
+          SUM(CASE WHEN event_type='prelabel_start' THEN 1 ELSE 0 END) prelabel_runs,
+          SUM(CASE WHEN event_type='prelabel_start' THEN value ELSE 0 END) prelabel_images,
+          SUM(elapsed_seconds) active_seconds,MAX(created_at) last_active
+        FROM filtered_events GROUP BY user_id
+      )
+      SELECT u.id,u.username,u.display_name,u.role,u.active,u.must_change_password,u.created_at,
+        COALESCE(s.images_saved,0) images_saved,COALESCE(s.boxes_saved,0) boxes_saved,
+        COALESCE(e.prelabel_runs,0) prelabel_runs,COALESCE(e.prelabel_images,0) prelabel_images,
+        COALESCE(e.active_seconds,0) active_seconds,e.last_active
+      FROM users u LEFT JOIN save_totals s ON s.user_id=u.id
+      LEFT JOIN event_totals e ON e.user_id=u.id {user_where}
+      ORDER BY images_saved DESC,u.username
+    """, [*filter_args, *user_args]).fetchall()
 
 @router.get("/api/performance/me")
 def performance_me(request: Request):
@@ -280,8 +302,10 @@ def _require_admin(request: Request) -> None:
 
 
 @router.get("/api/admin/users")
-def admin_users(request: Request):
-    _require_admin(request); connection = db(); rows = _performance_rows(connection); connection.close()
+def admin_users(request: Request, project_id: str | None = None, date_from: float | None = None, date_to: float | None = None):
+    _require_admin(request); connection = db()
+    rows = _performance_rows(connection, project_id=project_id, date_from=date_from, date_to=date_to)
+    connection.close()
     return {"users": [_user_dict(row) for row in rows]}
 
 

@@ -17,7 +17,7 @@ npm --prefix frontend run build
 cp -n .env.example .env
 ```
 
-Mở `.env` và đặt `PROTOLABEL_HOST_WORKSPACE` thành thư mục cha chứa `data/` và các dataset được phép truy cập. Session mặc định sống 7 ngày; chỉnh `PROTOLABEL_SESSION_TTL_SECONDS` nếu cần.
+Mở `.env` và đặt `PROTOLABEL_HOST_WORKSPACE` thành thư mục cha chứa `data/` và các dataset được phép truy cập. Session mặc định sống 7 ngày; chỉnh `PROTOLABEL_SESSION_TTL_SECONDS` nếu cần. Giới hạn scan mặc định là 250.000 ảnh (`PROTOLABEL_MAX_SCAN_IMAGES`); vượt ngưỡng job sẽ dừng với lỗi rõ ràng thay vì nạp không giới hạn vào RAM.
 
 ### Chạy backend và frontend bằng script
 
@@ -49,7 +49,8 @@ Lần đăng nhập đầu bắt buộc đổi sang mật khẩu tối thiểu 1
 
 Admin mở **Dashboard** trên header để:
 
-- Xem số ảnh/bbox đã lưu, số lần và số ảnh prelabel, active time và last active của từng user.
+- Xem số ảnh distinct có thay đổi annotation, snapshot bbox mới nhất, số lần/ảnh prelabel, active time và last active của từng user. Save lặp lại mà không có thay đổi không được tính.
+- Lọc Dashboard theo project và 7 ngày, 30 ngày hoặc toàn bộ thời gian.
 - Đổi role `admin`/`annotator`, khóa hoặc mở tài khoản.
 - Reset mật khẩu; user bị reset phải đổi mật khẩu ở lần đăng nhập kế tiếp.
 - Bật hoặc tắt đăng ký tài khoản mới.
@@ -74,7 +75,7 @@ Video theo đường dẫn phải nằm trong `PROTOLABEL_HOST_WORKSPACE`. Video
 4. Sửa box trên canvas hoặc inspector, bấm S để lưu.
 5. Dùng bộ lọc `Cần review` để kiểm tra prelabel trước khi export.
 
-Phím tắt: `A/D` ảnh trước/sau, `B` vẽ bbox, `Delete` xoá box, `1–9` đổi class, `P` prelabel ảnh hiện tại, `S` lưu & duyệt.
+Phím tắt: `A/D` ảnh trước/sau, `W` vẽ bbox, `Delete` xoá box, `1–9` đổi class, `P` prelabel ảnh hiện tại, `Ctrl+S` lưu & duyệt, `Z`/`X` chọn zoom in/out rồi click vị trí cần zoom; khi đã zoom có thể kéo ảnh để pan.
 
 ## GPU prelabel
 
@@ -115,6 +116,8 @@ Script tự tạo `models/`, bỏ qua file đã có; dùng `--force` để tải
 ## Dữ liệu và license
 
 Annotation lưu trong `<PROTOLABEL_HOST_WORKSPACE>/data/prot0label.sqlite3` (SQLite WAL), ảnh gốc không bị copy. Đây là code mới của project này; không dùng code hoặc dịch vụ thương mại của Roboflow/CVAT. Kiểm tra license riêng của từng checkpoint, thư viện và dataset trước khi phân phối.
+
+Mọi tọa độ ảnh (bbox, keypoints, crop bbox và tâm mask) dùng số thực chuẩn hóa `0..1`, gốc ở góc trên-trái. Bbox có dạng `[x, y, w, h]`, trong đó `x, y` là góc trên-trái và `w, h` là kích thước hộp, đều chia cho chiều rộng/chiều cao khung hình. Bên tiêu thụ đổi sang pixel bằng cách nhân trục x với `frame_w` và trục y với `frame_h`.
 
 ## Icon assets
 

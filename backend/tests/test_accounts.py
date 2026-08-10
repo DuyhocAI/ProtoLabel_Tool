@@ -42,8 +42,19 @@ class AccountTests(unittest.TestCase):
    self.assertEqual(outsider.post("/api/auth/register",json={"username":"blocked","password":"blocked-pass-123"}).status_code,403)
    r=outsider.post("/api/auth/login",json={"username":"worker2","password":"temporary-pass-123"}); self.assertEqual(r.status_code,200,r.text); self.assertTrue(r.json()["user"]["must_change_password"])
  def test_admin_performance(self):
-  self.login_admin(); self.seed(); self.client.get("/api/projects/p/images/i"); r=self.client.put("/api/projects/p/images/i/boxes",json={"boxes":[{"id":"b","cls_name":"person","bbox":[.1,.1,.2,.2],"source":"manual"}],"status":"labeled"}); self.assertEqual(r.status_code,200,r.text)
-  row=self.client.get("/api/admin/users").json()["users"][0]; self.assertEqual(row["images_saved"],1); self.assertEqual(row["boxes_saved"],1)
+  self.login_admin(); self.seed(); self.client.get("/api/projects/p/images/i")
+  one={"boxes":[{"id":"b","cls_name":"person","bbox":[.1,.1,.2,.2],"source":"manual"}],"status":"labeled"}
+  for _ in range(2):
+   r=self.client.put("/api/projects/p/images/i/boxes",json=one); self.assertEqual(r.status_code,200,r.text)
+  two={"boxes":[*one["boxes"],{"id":"b2","cls_name":"person","bbox":[.4,.4,.2,.2],"source":"manual"}],"status":"labeled"}
+  self.client.put("/api/projects/p/images/i/boxes",json=two)
+  row=self.client.get("/api/admin/users?project_id=p").json()["users"][0]; self.assertEqual(row["images_saved"],1); self.assertEqual(row["boxes_saved"],2)
+  future=self.client.get("/api/admin/users?date_from=9999999999").json()["users"][0]; self.assertEqual(future["images_saved"],0)
+ def test_top_left_xywh_bbox_contract(self):
+  self.login_admin(); self.seed(); bbox=[.1,.2,.3,.4]
+  r=self.client.put("/api/projects/p/images/i/boxes",json={"boxes":[{"id":"b","cls_name":"person","bbox":bbox,"source":"manual"}],"status":"labeled"}); self.assertEqual(r.status_code,200,r.text); self.assertEqual(r.json()["boxes"][0]["bbox"],bbox)
+  bad=self.client.put("/api/projects/p/images/i/boxes",json={"boxes":[{"id":"bad","cls_name":"person","bbox":[.8,.2,.3,.4],"source":"manual"}]}); self.assertEqual(bad.status_code,400,bad.text)
+
  def test_dynamic_models(self):
   self.login_admin(); (ROOT/"models"/"custom-detector.pt").write_bytes(b"weights"); (ROOT/"models"/"ignored.txt").write_text("no"); r=self.client.get("/api/models"); self.assertEqual([x["id"] for x in r.json()["models"]],["custom-detector.pt"])
  def test_invalid_conf(self):

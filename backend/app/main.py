@@ -33,6 +33,7 @@ ALLOWED_ROOT = Path(os.getenv("PROTOLABEL_ROOT", ROOT)).resolve()
 EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 MAX_UPLOAD_BYTES = int(os.getenv("PROTOLABEL_MAX_UPLOAD_BYTES", str(2 * 1024**3)))
 MAX_UPLOAD_FILES = int(os.getenv("PROTOLABEL_MAX_UPLOAD_FILES", "10000"))
+MAX_SCAN_IMAGES = int(os.getenv("PROTOLABEL_MAX_SCAN_IMAGES", "250000"))
 JOB_RETENTION_SECONDS = int(os.getenv("PROTOLABEL_JOB_RETENTION_SECONDS", "86400"))
 JOB_DIR = DATA / "jobs"
 logger = logging.getLogger("protolabel")
@@ -79,13 +80,17 @@ def init_db() -> None:
     );
     CREATE TABLE IF NOT EXISTS boxes(
       id TEXT PRIMARY KEY, image_id TEXT NOT NULL, cls_name TEXT NOT NULL,
-      x1 REAL NOT NULL, y1 REAL NOT NULL, x2 REAL NOT NULL, y2 REAL NOT NULL,
+      x REAL NOT NULL, y REAL NOT NULL, w REAL NOT NULL, h REAL NOT NULL,
       confidence REAL, source TEXT NOT NULL DEFAULT "manual", attrs TEXT NOT NULL DEFAULT "{}"
     );
     CREATE INDEX IF NOT EXISTS image_project_status ON images(project_id,status,rel_path);
     CREATE INDEX IF NOT EXISTS box_image ON boxes(image_id);
     CREATE TABLE IF NOT EXISTS app_metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL);
         """)
+        columns = {row[1] for row in c.execute("PRAGMA table_info(boxes)")}
+        if "x1" in columns:
+            for old, new in (("x1", "x"), ("y1", "y"), ("x2", "w"), ("y2", "h")):
+                c.execute(f"ALTER TABLE boxes RENAME COLUMN {old} TO {new}")
         convention = c.execute("SELECT value FROM app_metadata WHERE key=?", ("bbox_coordinate_system",)).fetchone()
         if convention is None:
             box_count = c.execute("SELECT COUNT(*) FROM boxes").fetchone()[0]
@@ -94,7 +99,13 @@ def init_db() -> None:
                     "Database has boxes but no bbox_coordinate_system marker. "
                     "Refusing to mutate coordinates automatically; restore metadata or run an explicit migration."
                 )
-            c.execute("INSERT INTO app_metadata(key,value) VALUES(?,?)", ("bbox_coordinate_system", "normalized_bottom_left_v1"))
+            c.execute("INSERT INTO app_metadata(key,value) VALUES(?,?)", ("bbox_coordinate_system", "normalized_top_left_xywh_v1"))
+        elif convention[0] == "normalized_bottom_left_v1":
+            # Legacy normalized bottom-left [x1,y1,x2,y2] -> top-left [x,y,w,h].
+            c.execute("UPDATE boxes SET x=x,y=1-h,w=w-x,h=h-y")
+            c.execute("UPDATE app_metadata SET value=? WHERE key=?", ("normalized_top_left_xywh_v1", "bbox_coordinate_system"))
+        elif convention[0] != "normalized_top_left_xywh_v1":
+            raise RuntimeError(f"Unsupported bbox coordinate system: {convention[0]}")
         c.commit()
     finally:
         c.close()
@@ -298,7 +309,13 @@ def delete_project(pid: str):
 def _scan_project_job(jid: str, root: Path, name: str, classes: list[str]):
     update_job(jid, status="running", stage="discovering", detail="Đang tìm file ảnh…")
     try:
-        files = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in EXTS]
+        files = []
+        for path in root.rglob("*"):
+            if path.is_file() and path.suffix.lower() in EXTS:
+                files.append(path)
+                if len(files) > MAX_SCAN_IMAGES:
+                    update_job(jid, status="error", stage="limit", error="Scan limit exceeded", detail=f"Thư mục có hơn {MAX_SCAN_IMAGES:,} ảnh; hãy chọn thư mục hẹp hơn hoặc tăng PROTOLABEL_MAX_SCAN_IMAGES")
+                    return
         update_job(jid, stage="indexing", total=len(files), processed=0, detail=f"Đã tìm thấy {len(files):,} file; đang đọc metadata…")
         pid = uuid.uuid4().hex[:12]
         c = db()
@@ -440,7 +457,7 @@ def image_detail(pid: str, iid: str, request: Request):
     if not row: raise HTTPException(404, "Không tìm thấy ảnh")
     boxes = c.execute("SELECT * FROM boxes WHERE image_id=? ORDER BY rowid", (iid,)).fetchall(); c.close()
     record_image_open(request.state.user["id"], iid)
-    return {**dict(row), "url": f"/api/projects/{pid}/media/{iid}", "classes": json.loads(p["classes"]), "boxes": [{"id": b["id"], "cls_name": b["cls_name"], "bbox": [b["x1"], b["y1"], b["x2"], b["y2"]], "confidence": b["confidence"], "source": b["source"], "attributes": json.loads(b["attrs"])} for b in boxes]}
+    return {**dict(row), "url": f"/api/projects/{pid}/media/{iid}", "classes": json.loads(p["classes"]), "boxes": [{"id": b["id"], "cls_name": b["cls_name"], "bbox": [b["x"], b["y"], b["w"], b["h"]], "confidence": b["confidence"], "source": b["source"], "attributes": json.loads(b["attrs"])} for b in boxes]}
 
 
 @app.get("/api/projects/{pid}/media/{iid}")
@@ -455,38 +472,55 @@ def media(pid: str, iid: str):
 @app.put("/api/projects/{pid}/images/{iid}/boxes")
 def save_boxes(pid: str, iid: str, payload: dict[str, Any], request: Request):
     c = db(); get_project(c, pid)
-    if not c.execute("SELECT 1 FROM images WHERE id=? AND project_id=?", (iid, pid)).fetchone(): raise HTTPException(404, "Image not found")
+    image_row = c.execute("SELECT status FROM images WHERE id=? AND project_id=?", (iid, pid)).fetchone()
+    if not image_row:
+        c.close(); raise HTTPException(404, "Image not found")
+    raw_boxes = payload.get("boxes", [])
+    if not isinstance(raw_boxes, list):
+        c.close(); raise HTTPException(422, "boxes must be a list")
+    normalized = []
     try:
-        c.execute("BEGIN IMMEDIATE")
-        c.execute("DELETE FROM boxes WHERE image_id=?", (iid,))
-        for a in payload.get("boxes", []):
-            bbox_raw = a.get("bbox", [0,0,0,0])
-            try:
-                b = [float(v) for v in bbox_raw]
-            except (ValueError, TypeError):
-                raise ValueError(f"Invalid bbox values (not numeric): {bbox_raw}")
-            if len(b) != 4:
-                raise ValueError(f"Bbox must have 4 values, got {len(b)}")
-            if not all(0.0 <= v <= 1.0 for v in b):
-                raise ValueError(f"Bbox values must be in [0, 1], got {b}")
-            if b[2] <= b[0] or b[3] <= b[1]:
-                raise ValueError(f"Invalid bbox: x2 must be > x1, y2 must be > y1")
-            attributes = dict(a.get("attributes") or {})
+        for item in raw_boxes:
+            bbox_raw = item.get("bbox", [0, 0, 0, 0])
+            b = [float(v) for v in bbox_raw]
+            if len(b) != 4 or not all(0.0 <= v <= 1.0 for v in b):
+                raise ValueError(f"Bbox must contain four normalized values, got {bbox_raw}")
+            x, y, width, height = b
+            if width <= 0 or height <= 0 or x + width > 1.0 or y + height > 1.0:
+                raise ValueError("Invalid bbox extent")
+            attributes = dict(item.get("attributes") or {})
             reid_id = str(attributes.get("reid_id", "")).strip()[:64]
-            if reid_id:
-                attributes["reid_id"] = reid_id
-            else:
-                attributes.pop("reid_id", None)
-            c.execute("INSERT INTO boxes VALUES(?,?,?,?,?,?,?,?,?,?)", (a.get("id") or uuid.uuid4().hex[:16], iid, str(a.get("cls_name", "object")), *b, a.get("confidence"), str(a.get("source", "manual")), jsons(attributes)))
-        status = payload.get("status") or ("labeled" if payload.get("boxes") else "unlabeled")
-        if status not in {"unlabeled", "review", "labeled"}: status = "labeled"
-        c.execute("UPDATE images SET status=? WHERE id=?", (status, iid))
-        c.commit()
-    except Exception as exc:
-        c.execute("ROLLBACK")
-        raise HTTPException(400, f"Save failed: {str(exc)}")
-    finally: c.close()
-    record_event(request.state.user["id"], "image_save", pid, iid, len(payload.get("boxes", [])), track_elapsed=True)
+            if reid_id: attributes["reid_id"] = reid_id
+            else: attributes.pop("reid_id", None)
+            normalized.append({"id": str(item.get("id") or uuid.uuid4().hex[:16]),
+                "cls_name": str(item.get("cls_name", "object")), "bbox": b,
+                "confidence": item.get("confidence"), "source": str(item.get("source", "manual")),
+                "attributes": attributes})
+    except (AttributeError, TypeError, ValueError) as exc:
+        c.close(); raise HTTPException(400, f"Save failed: {exc}")
+    status = payload.get("status") or ("labeled" if normalized else "unlabeled")
+    if status not in {"unlabeled", "review", "labeled"}: status = "labeled"
+    existing = c.execute("SELECT * FROM boxes WHERE image_id=?", (iid,)).fetchall()
+    def signature(box):
+        bbox = box["bbox"] if isinstance(box, dict) else [box["x"], box["y"], box["w"], box["h"]]
+        attrs = box["attributes"] if isinstance(box, dict) else json.loads(box["attrs"])
+        return (str(box["id"]), str(box["cls_name"]), tuple(float(v) for v in bbox),
+                box["confidence"], str(box["source"]), json.dumps(attrs, sort_keys=True))
+    changed = status != image_row["status"] or sorted(map(signature, normalized)) != sorted(map(signature, existing))
+    if changed:
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            c.execute("DELETE FROM boxes WHERE image_id=?", (iid,))
+            for item in normalized:
+                c.execute("INSERT INTO boxes VALUES(?,?,?,?,?,?,?,?,?,?)",
+                          (item["id"], iid, item["cls_name"], *item["bbox"], item["confidence"],
+                           item["source"], jsons(item["attributes"])))
+            c.execute("UPDATE images SET status=? WHERE id=?", (status, iid)); c.commit()
+        except Exception as exc:
+            c.rollback(); c.close(); raise HTTPException(400, f"Save failed: {exc}")
+    c.close()
+    if changed:
+        record_event(request.state.user["id"], "image_save", pid, iid, len(normalized), track_elapsed=True)
     return image_detail(pid, iid, request)
 
 
@@ -509,7 +543,7 @@ def predict(model_id: str, path: Path, conf: float, iou: float, device: str | No
     if result.boxes is not None:
         for box, score, cls in zip(result.boxes.xyxy.cpu().tolist(), result.boxes.conf.cpu().tolist(), result.boxes.cls.cpu().tolist()):
             x1,y1,x2,y2 = box
-            out.append({"id": uuid.uuid4().hex[:16], "cls_name": str(names.get(int(cls), int(cls))), "bbox": [x1/w,1-y2/h,x2/w,1-y1/h], "confidence": float(score), "source": model_id, "attributes": {}})
+            out.append({"id": uuid.uuid4().hex[:16], "cls_name": str(names.get(int(cls), int(cls))), "bbox": [x1/w,y1/h,(x2-x1)/w,(y2-y1)/h], "confidence": float(score), "source": model_id, "attributes": {}})
     return out
 
 
@@ -712,13 +746,13 @@ def export_project(pid: str, format: str = "yolo"):
         for row in rows:
             boxes = c.execute("SELECT * FROM boxes WHERE image_id=?", (row["id"],)).fetchall()
             if format == "json":
-                z.writestr(f"annotations/{row['rel_path']}.json", jsons({"image": row["rel_path"], "width": row["width"], "height": row["height"], "boxes": [{"class": b["cls_name"], "bbox": [b["x1"],b["y1"],b["x2"],b["y2"]], "confidence": b["confidence"], "source": b["source"], "attributes": json.loads(b["attrs"]), "reid_id": (json.loads(b["attrs"]) or {}).get("reid_id")} for b in boxes]}))
+                z.writestr(f"annotations/{row['rel_path']}.json", jsons({"image": row["rel_path"], "width": row["width"], "height": row["height"], "boxes": [{"class": b["cls_name"], "bbox": [b["x"],b["y"],b["w"],b["h"]], "confidence": b["confidence"], "source": b["source"], "attributes": json.loads(b["attrs"]), "reid_id": (json.loads(b["attrs"]) or {}).get("reid_id")} for b in boxes]}))
             else:
                 lines=[]
                 for b in boxes:
                     if b["cls_name"] not in classes: continue
-                    cx=(b["x1"]+b["x2"])/2; cy=1-(b["y1"]+b["y2"])/2
-                    lines.append(f"{classes.index(b['cls_name'])} {cx:.6f} {cy:.6f} {(b['x2']-b['x1']):.6f} {(b['y2']-b['y1']):.6f}")
+                    cx=b["x"]+b["w"]/2; cy=b["y"]+b["h"]/2
+                    lines.append(f"{classes.index(b['cls_name'])} {cx:.6f} {cy:.6f} {b['w']:.6f} {b['h']:.6f}")
                 z.writestr(f"labels/{Path(row['rel_path']).with_suffix('.txt')}", "\n".join(lines) + ("\n" if lines else ""))
     c.close()
     return FileResponse(out, media_type="application/zip", filename=f"{p['name']}-{format}.zip", background=BackgroundTask(out.unlink, missing_ok=True))
