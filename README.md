@@ -17,7 +17,7 @@ npm --prefix frontend run build
 cp -n .env.example .env
 ```
 
-Mở `.env`, đặt `PROTOLABEL_AUTH_PASSWORD` thành mật khẩu dài, riêng biệt; không commit hoặc chia sẻ file này. Có thể tạo mật khẩu bằng `openssl rand -hex 24`. Đặt `PROTOLABEL_HOST_WORKSPACE` thành thư mục cha chứa `data/` và các dataset được phép truy cập.
+Mở `.env` và đặt `PROTOLABEL_HOST_WORKSPACE` thành thư mục cha chứa `data/` và các dataset được phép truy cập. Session mặc định sống 7 ngày; chỉnh `PROTOLABEL_SESSION_TTL_SECONDS` nếu cần.
 
 ### Chạy backend và frontend bằng script
 
@@ -26,7 +26,7 @@ chmod +x scripts/run_all.sh
 ./scripts/run_all.sh
 ```
 
-Script tự đọc `.env`, dùng conda environment `sgdetr` nếu có, chạy backend nội bộ tại `127.0.0.1:8100`, frontend tại `0.0.0.0:8101`, và ghi log vào `logs/`. Mở `http://<IP-SERVER>:8101`; trình duyệt sẽ yêu cầu username/password từ `.env`. Nhấn `Ctrl+C` để dừng cả hai service.
+Script tự đọc `.env`, dùng conda environment `sgdetr` nếu có, chạy backend nội bộ tại `127.0.0.1:8100`, frontend tại `0.0.0.0:8101`, và ghi log vào `logs/`. Mở `http://<IP-SERVER>:8101`; trình duyệt sẽ hiện màn Login/Register. Nhấn `Ctrl+C` để dừng cả hai service.
 
 Nếu Ubuntu bật UFW, chỉ mở frontend:
 
@@ -35,6 +35,26 @@ sudo ufw allow 8101/tcp
 ```
 
 Không mở cổng `8100` ra LAN.
+
+## Tài khoản và hiệu suất
+
+Khi database chưa có user, backend tự tạo tài khoản quản trị ban đầu:
+
+```text
+username: admin
+password: admin
+```
+
+Lần đăng nhập đầu bắt buộc đổi sang mật khẩu tối thiểu 10 ký tự. Không tiếp tục dùng `admin/admin`. Người dùng khác đăng ký từ màn Register và mặc định có role `annotator`.
+
+Admin mở **Dashboard** trên header để:
+
+- Xem số ảnh/bbox đã lưu, số lần và số ảnh prelabel, active time và last active của từng user.
+- Đổi role `admin`/`annotator`, khóa hoặc mở tài khoản.
+- Reset mật khẩu; user bị reset phải đổi mật khẩu ở lần đăng nhập kế tiếp.
+- Bật hoặc tắt đăng ký tài khoản mới.
+
+User có thể đổi mật khẩu từ nút **Password** trên header. Password chỉ được lưu dưới dạng `scrypt` hash; phiên đăng nhập dùng cookie HttpOnly/SameSite. Hiệu suất bắt đầu được ghi từ lúc deploy phiên bản account, annotation cũ không bị sửa và không được gán ngược cho user.
 
 ## Import video và tách frame
 
@@ -80,7 +100,9 @@ inference model chạy trên GPU.
 
 ## Model registry
 
-ProtoLabel chỉ hiển thị họ YOLO26: `yolo26n`, `yolo26s`, `yolo26m`, `yolo26l`, `yolo26x`. Checkpoint không được lưu trong Git vì có dung lượng lớn. Sau khi clone repository và cài dependency backend, tải đủ model chính thức của Ultralytics bằng:
+Danh sách Prelabel không hardcode model. Backend quét trực tiếp thư mục `models/` mỗi lần gọi `/api/models` và hiển thị các file `.pt`, `.onnx`, `.engine`, `.torchscript`. Thêm checkpoint mới vào thư mục này rồi refresh model/page; không cần sửa backend.
+
+Checkpoint không lưu trong Git vì dung lượng lớn. Tải bộ YOLO26 mặc định của Ultralytics bằng:
 
 ```bash
 cd /duong/dan/toi/ProtoLabel_Tool
@@ -88,9 +110,7 @@ conda activate sgdetr
 python scripts/download_models.py
 ```
 
-Script tự tạo `models/`, bỏ qua file đã có và tải các checkpoint còn thiếu. Dùng `python scripts/download_models.py --force` nếu cần tải lại toàn bộ. Có thể dùng thư mục khác với `--model-dir /duong/dan/models` và đặt `PROTOLABEL_MODEL_DIR` trùng với đường dẫn đó khi chạy backend.
-
-Sau khi tải xong, checkpoint nằm trong `Protolabel/models` và sẵn sàng cho prelabel. Model được backend nạp lazy và cache một lần.
+Script tự tạo `models/`, bỏ qua file đã có; dùng `--force` để tải lại. Model tùy chỉnh phải tương thích với Ultralytics `YOLO(...)`, nếu không inference sẽ trả lỗi model tương ứng.
 
 ## Dữ liệu và license
 
@@ -115,7 +135,6 @@ cp -n .env.example .env
 Trước khi chạy, sửa `.env`:
 
 - `PROTOLABEL_HOST_WORKSPACE`: đường dẫn tuyệt đối tới workspace chứa `data/` và dataset.
-- `PROTOLABEL_AUTH_PASSWORD`: mật khẩu dài; có thể tạo bằng `openssl rand -hex 24`.
 - `PROTOLABEL_UID` và `PROTOLABEL_GID`: kết quả của `id -u` và `id -g`, để backend không chạy root nhưng vẫn ghi được database.
 
 Sau đó:
@@ -127,7 +146,7 @@ sudo docker compose up -d
 sudo docker compose ps
 ```
 
-Backend phải có trạng thái `healthy`. Mở `http://<IP-SERVER>:8101` và đăng nhập bằng `PROTOLABEL_AUTH_USERNAME`/`PROTOLABEL_AUTH_PASSWORD`. `/docs`, API, media và export đều được bảo vệ bằng cùng credential.
+Backend phải có trạng thái `healthy`. Mở `http://<IP-SERVER>:8101`; màn Login/Register sẽ xuất hiện. Đăng nhập lần đầu bằng `admin/admin` và đổi password ngay. `/docs`, API, media và export đều yêu cầu session hợp lệ.
 
 ### Xem log và rebuild
 

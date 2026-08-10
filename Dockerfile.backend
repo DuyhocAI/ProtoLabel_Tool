@@ -8,7 +8,7 @@ RUN pip install --upgrade pip \
     && pip uninstall -y opencv-python opencv-contrib-python
 RUN pip install --force-reinstall "opencv-python-headless>=4.10" \
     && python -c "import cv2; print(\"OpenCV headless:\", cv2.__version__)"
-COPY --chown=10001:10001 backend/app/__init__.py backend/app/main.py /app/app/
+COPY --chown=10001:10001 backend/app/__init__.py backend/app/main.py backend/app/auth.py /app/app/
 COPY --chown=10001:10001 models /models
 RUN groupadd --gid 10001 protolabel && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin protolabel
 USER protolabel

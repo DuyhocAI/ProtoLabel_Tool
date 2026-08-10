@@ -19,9 +19,6 @@ if [[ -f "$ROOT_DIR/.env" ]]; then
   source "$ROOT_DIR/.env"
   set +a
 fi
-if [[ -z "${PROTOLABEL_AUTH_PASSWORD:-}" ]]; then
-  echo "[ProtoLabel] Thiếu PROTOLABEL_AUTH_PASSWORD trong .env" >&2; exit 1
-fi
 
 # 0.0.0.0 chỉ dùng để bind server. Người dùng phải mở bằng IP LAN thật.
 LAN_IPS=""

@@ -1,12 +1,10 @@
 """ProtoLabel: local-first dataset labeling and model-assisted review API."""
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import logging
 import os
-import secrets
 import sqlite3
 import threading
 import time
@@ -24,6 +22,8 @@ from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 from starlette.responses import JSONResponse
 
+from .auth import authenticate, init_auth_schema, record_event, record_image_open, router as auth_router
+
 _workspace_root = os.getenv("PROTOLABEL_WORKSPACE_ROOT")
 ROOT = Path(_workspace_root).resolve() if _workspace_root else Path(__file__).resolve().parents[3]
 DATA = Path(os.getenv("PROTOLABEL_DATA_DIR", ROOT / "data")).resolve()
@@ -33,13 +33,12 @@ ALLOWED_ROOT = Path(os.getenv("PROTOLABEL_ROOT", ROOT)).resolve()
 EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 MAX_UPLOAD_BYTES = int(os.getenv("PROTOLABEL_MAX_UPLOAD_BYTES", str(2 * 1024**3)))
 MAX_UPLOAD_FILES = int(os.getenv("PROTOLABEL_MAX_UPLOAD_FILES", "10000"))
-AUTH_USERNAME = os.getenv("PROTOLABEL_AUTH_USERNAME", "protolabel")
-AUTH_PASSWORD = os.getenv("PROTOLABEL_AUTH_PASSWORD", "")
 JOB_RETENTION_SECONDS = int(os.getenv("PROTOLABEL_JOB_RETENTION_SECONDS", "86400"))
 JOB_DIR = DATA / "jobs"
 logger = logging.getLogger("protolabel")
 
-app = FastAPI(title="ProtoLabel", version="0.1.0")
+app = FastAPI(title="ProtoLabel", version="0.2.0")
+app.include_router(auth_router)
 # CORS restricted to frontend origin only (security fix)
 ALLOWED_ORIGINS = os.getenv("CORS_ORIGINS", "http://localhost:8101,http://127.0.0.1:8101").split(",")
 app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_methods=["GET", "POST", "PUT", "DELETE"], allow_headers=["Content-Type", "Authorization"])
@@ -53,26 +52,7 @@ model_lock = threading.Lock()
 
 @app.middleware("http")
 async def require_auth(request: Request, call_next):
-    if request.url.path == "/api/health":
-        return await call_next(request)
-    if not AUTH_PASSWORD:
-        return JSONResponse({"detail": "Server authentication is not configured"}, status_code=503)
-    authorization = request.headers.get("Authorization", "")
-    authenticated = False
-    if authorization.startswith("Basic "):
-        try:
-            decoded = base64.b64decode(authorization[6:], validate=True).decode("utf-8")
-            username, password = decoded.split(":", 1)
-            authenticated = secrets.compare_digest(username, AUTH_USERNAME) and secrets.compare_digest(password, AUTH_PASSWORD)
-        except (ValueError, UnicodeDecodeError):
-            pass
-    if not authenticated:
-        return JSONResponse(
-            {"detail": "Authentication required"},
-            status_code=401,
-            headers={"WWW-Authenticate": "Basic realm=ProtoLabel"},
-        )
-    return await call_next(request)
+    return await authenticate(request, call_next)
 
 
 @app.exception_handler(Exception)
@@ -122,9 +102,8 @@ def init_db() -> None:
 
 @app.on_event("startup")
 def startup() -> None:
-    if not AUTH_PASSWORD:
-        logger.error("PROTOLABEL_AUTH_PASSWORD is not configured; protected endpoints will return 503")
     init_db()
+    init_auth_schema()
     load_jobs()
 
 
@@ -253,14 +232,20 @@ def runtime_info() -> dict[str, Any]:
 
 
 def model_options() -> list[dict[str, Any]]:
-    candidates = [
-        ("yolo26n", "YOLO26 nano · nhanh nhất", MODEL_DIR / "yolo26n.pt"),
-        ("yolo26s", "YOLO26 small · nhanh", MODEL_DIR / "yolo26s.pt"),
-        ("yolo26m", "YOLO26 medium · cân bằng", MODEL_DIR / "yolo26m.pt"),
-        ("yolo26l", "YOLO26 large · chính xác", MODEL_DIR / "yolo26l.pt"),
-        ("yolo26x", "YOLO26 extra-large · chính xác nhất", MODEL_DIR / "yolo26x.pt"),
-    ]
-    return [{"id": k, "label": label, "path": str(path), "available": path.is_file()} for k, label, path in candidates]
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    supported = {".pt", ".onnx", ".engine", ".torchscript"}
+    result = []
+    for path in sorted(MODEL_DIR.iterdir(), key=lambda item: item.name.casefold()):
+        if path.is_symlink() or not path.is_file() or path.suffix.lower() not in supported:
+            continue
+        result.append({
+            "id": path.name,
+            "label": path.stem.replace("_", " ").replace("-", " "),
+            "format": path.suffix.lower().lstrip("."),
+            "size_mb": round(path.stat().st_size / 1024**2, 1),
+            "available": True,
+        })
+    return result
 
 
 def get_project(c: sqlite3.Connection, pid: str):
@@ -450,10 +435,11 @@ def image_list(pid: str, status: str = "all", search: str = "", page: int = 1, p
 
 
 @app.get("/api/projects/{pid}/images/{iid}")
-def image_detail(pid: str, iid: str):
+def image_detail(pid: str, iid: str, request: Request):
     c = db(); p = get_project(c, pid); row = c.execute("SELECT * FROM images WHERE id=? AND project_id=?", (iid, pid)).fetchone()
     if not row: raise HTTPException(404, "Không tìm thấy ảnh")
     boxes = c.execute("SELECT * FROM boxes WHERE image_id=? ORDER BY rowid", (iid,)).fetchall(); c.close()
+    record_image_open(request.state.user["id"], iid)
     return {**dict(row), "url": f"/api/projects/{pid}/media/{iid}", "classes": json.loads(p["classes"]), "boxes": [{"id": b["id"], "cls_name": b["cls_name"], "bbox": [b["x1"], b["y1"], b["x2"], b["y2"]], "confidence": b["confidence"], "source": b["source"], "attributes": json.loads(b["attrs"])} for b in boxes]}
 
 
@@ -467,7 +453,7 @@ def media(pid: str, iid: str):
 
 
 @app.put("/api/projects/{pid}/images/{iid}/boxes")
-def save_boxes(pid: str, iid: str, payload: dict[str, Any]):
+def save_boxes(pid: str, iid: str, payload: dict[str, Any], request: Request):
     c = db(); get_project(c, pid)
     if not c.execute("SELECT 1 FROM images WHERE id=? AND project_id=?", (iid, pid)).fetchone(): raise HTTPException(404, "Image not found")
     try:
@@ -500,7 +486,8 @@ def save_boxes(pid: str, iid: str, payload: dict[str, Any]):
         c.execute("ROLLBACK")
         raise HTTPException(400, f"Save failed: {str(exc)}")
     finally: c.close()
-    return image_detail(pid, iid)
+    record_event(request.state.user["id"], "image_save", pid, iid, len(payload.get("boxes", [])), track_elapsed=True)
+    return image_detail(pid, iid, request)
 
 
 def predict(model_id: str, path: Path, conf: float, iou: float, device: str | None):
@@ -512,7 +499,7 @@ def predict(model_id: str, path: Path, conf: float, iou: float, device: str | No
         raise RuntimeError("Cài ultralytics trong môi trường sgdetr trước khi chạy prelabel") from exc
     with model_lock:
         model = model_cache.get(model_id)
-        if model is None: model = model_cache.setdefault(model_id, YOLO(opts[model_id]["path"]))
+        if model is None: model = model_cache.setdefault(model_id, YOLO(str(MODEL_DIR / model_id)))
     selected_device = resolve_device(device)
     kwargs = {"source": str(path), "conf": conf, "iou": iou, "verbose": False, "device": selected_device}
     if selected_device != "cpu": kwargs["half"] = True
@@ -553,7 +540,7 @@ def prelabel_job(job_id: str, pid: str, ids: list[str], model_id: str, conf: flo
 
 
 @app.post("/api/projects/{pid}/prelabel")
-def start_prelabel(pid: str, payload: dict[str, Any]):
+def start_prelabel(pid: str, payload: dict[str, Any], request: Request):
     c = db()
     get_project(c, pid)
     requested_ids = payload.get("image_ids")
@@ -570,11 +557,12 @@ def start_prelabel(pid: str, payload: dict[str, Any]):
         raise HTTPException(400, "Không có ảnh để prelabel")
     conf = numeric_field(payload, "conf", .25, .01, 1.0)
     iou = numeric_field(payload, "iou", .7, .01, 1.0)
-    model_id = str(payload.get("model_id", "yolo26n"))
     models_by_id = {item["id"]: item for item in model_options()}
+    model_id = str(payload.get("model_id") or next(iter(models_by_id), ""))
     if model_id not in models_by_id or not models_by_id[model_id]["available"]:
         raise HTTPException(422, "Selected checkpoint is unavailable")
     job_data = create_job("prelabel", processed=0, total=len(ids), error=None, device=resolve_device(payload.get("device")))
+    record_event(request.state.user["id"], "prelabel_start", pid, value=len(ids))
     pool.submit(prelabel_job, job_data["id"], pid, ids, model_id, conf, iou, bool(payload.get("replace", True)), payload.get("device"))
     return job_data
 
