@@ -1,0 +1,37 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    restart: unless-stopped
+    environment:
+      PROTOLABEL_WORKSPACE_ROOT: /home/tts02/AI/DuyNAB
+      PROTOLABEL_DATA_DIR: /home/tts02/AI/DuyNAB/data
+      PROTOLABEL_MODEL_DIR: /models
+      PROTOLABEL_ROOT: /home/tts02/AI/DuyNAB
+      CORS_ORIGINS: http://localhost:8101,http://127.0.0.1:8101
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    volumes:
+      - ${PROTOLABEL_HOST_WORKSPACE:-/home/tts02/AI/DuyNAB}:/home/tts02/AI/DuyNAB
+      - ./models:/models:ro
+    gpus: all
+    ports:
+      - "8100:8100"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8100/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "8101:80"

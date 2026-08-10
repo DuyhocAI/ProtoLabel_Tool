@@ -1,0 +1,17 @@
+backend/data/*.sqlite3*
+backend/data/*.zip
+frontend/node_modules/
+frontend/dist/
+skills/
+__pycache__/
+*.pyc
+
+# Local runtime and secrets
+.env
+logs/
+.run/
+
+# Downloaded model checkpoints
+models/*.pt
+models/*.onnx
+models/*.engine

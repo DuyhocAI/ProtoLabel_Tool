@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title desc">
+  <title id="title">ProtoLabel mark</title>
+  <desc id="desc">A label frame with a P monogram</desc>
+  <defs>
+    <linearGradient id="bg" x1="8" y1="6" x2="56" y2="58" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#EAF3FF"/>
+      <stop offset="1" stop-color="#DCEBFF"/>
+    </linearGradient>
+    <linearGradient id="ink" x1="17" y1="14" x2="48" y2="50" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#328BE1"/>
+      <stop offset="1" stop-color="#1D66B6"/>
+    </linearGradient>
+  </defs>
+  <rect x="3" y="3" width="58" height="58" rx="16" fill="url(#bg)"/>
+  <path d="M18 25v-5a3 3 0 0 1 3-3h5M39 17h4a3 3 0 0 1 3 3v5M46 39v5a3 3 0 0 1-3 3h-5M25 47h-4a3 3 0 0 1-3-3v-5" fill="none" stroke="url(#ink)" stroke-width="3.2" stroke-linecap="round"/>
+  <path d="M25 42V22h8.2c5.5 0 8.8 2.8 8.8 7.5S38.7 37 33.2 37H29v5h-4Zm4-9h3.7c3.1 0 5.1-1.6 5.1-4.4 0-2.9-2-4.5-5.1-4.5H29V33Z" fill="url(#ink)"/>
+  <circle cx="47" cy="18" r="4" fill="#36C7A5" stroke="#fff" stroke-width="2"/>
+</svg>
