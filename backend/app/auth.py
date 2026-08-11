@@ -25,7 +25,18 @@ SESSION_COOKIE = "protolabel_session"
 SESSION_TTL = int(os.getenv("PROTOLABEL_SESSION_TTL_SECONDS", str(7 * 86400)))
 ACTIVE_SESSION_CAP_SECONDS = int(os.getenv("PROTOLABEL_ACTIVE_SESSION_CAP_SECONDS", "900"))
 COOKIE_SECURE = os.getenv("PROTOLABEL_COOKIE_SECURE", "false").lower() == "true"
+LOGIN_MAX_ATTEMPTS = max(1, int(os.getenv("PROTOLABEL_LOGIN_MAX_ATTEMPTS", "5")))
+LOGIN_WINDOW_SECONDS = max(60, int(os.getenv("PROTOLABEL_LOGIN_WINDOW_SECONDS", "900")))
 PUBLIC_PATHS = {"/api/health", "/api/auth/login", "/api/auth/register"}
+# Same allowlist as CORSMiddleware in main.py (duplicated here to avoid a circular
+# import). Comparing Origin against this fixed list instead of the request's Host
+# header means the check no longer breaks behind a reverse proxy that does not
+# forward the original Host verbatim (e.g. Vite's dev/preview `/api` proxy).
+ALLOWED_ORIGIN_NETLOCS = {
+    urlparse(origin.strip()).netloc
+    for origin in os.getenv("CORS_ORIGINS", "http://localhost:8101,http://127.0.0.1:8101").split(",")
+    if origin.strip()
+}
 USERNAME_RE = re.compile(r"^[a-zA-Z0-9_.-]{3,32}$")
 router = APIRouter()
 
@@ -83,6 +94,16 @@ def init_auth_schema() -> None:
           user_id TEXT NOT NULL, image_id TEXT NOT NULL, opened_at REAL NOT NULL,
           PRIMARY KEY(user_id,image_id)
         );
+        CREATE TABLE IF NOT EXISTS user_preferences(
+          user_id TEXT PRIMARY KEY, shortcuts TEXT NOT NULL DEFAULT '{}', updated_at REAL NOT NULL,
+          FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS login_attempts(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL,
+          remote_ip TEXT NOT NULL, created_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS login_attempts_identity_time
+          ON login_attempts(username,remote_ip,created_at);
         CREATE TABLE IF NOT EXISTS app_settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
         INSERT OR IGNORE INTO app_settings(key,value) VALUES('registration_enabled','1');
         """)
@@ -118,7 +139,7 @@ async def authenticate(request: Request, call_next):
         return JSONResponse({"detail": "Authentication required"}, status_code=401)
     if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
         origin = request.headers.get("origin")
-        if origin and urlparse(origin).netloc != request.headers.get("host"):
+        if origin and urlparse(origin).netloc not in ALLOWED_ORIGIN_NETLOCS:
             return JSONResponse({"detail": "Invalid request origin"}, status_code=403)
     request.state.user = dict(user)
     allowed_while_changing = {"/api/auth/me", "/api/auth/change-password", "/api/auth/logout"}
@@ -194,13 +215,29 @@ def register(payload: dict[str, Any]):
 
 
 @router.post("/api/auth/login")
-def login(payload: dict[str, Any]):
+def login(request: Request, payload: dict[str, Any]):
     username, password = str(payload.get("username", "")).strip(), str(payload.get("password", ""))
+    identity = username.casefold()[:32]
+    remote_ip = (request.client.host if request.client else "unknown")[:64]
+    now = time.time()
     connection = db()
+    connection.execute("DELETE FROM login_attempts WHERE created_at<?", (now - LOGIN_WINDOW_SECONDS,))
+    failures = connection.execute(
+        "SELECT COUNT(*) FROM login_attempts WHERE username=? AND remote_ip=? AND created_at>=?",
+        (identity, remote_ip, now - LOGIN_WINDOW_SECONDS),
+    ).fetchone()[0]
+    if failures >= LOGIN_MAX_ATTEMPTS:
+        connection.commit(); connection.close()
+        raise HTTPException(429, f"Too many login attempts; retry in {LOGIN_WINDOW_SECONDS // 60} minutes")
     row = connection.execute("SELECT * FROM users WHERE username=? COLLATE NOCASE AND active=1", (username,)).fetchone()
     if not row or not verify_password(password, row["password_salt"], row["password_hash"]):
-        connection.close()
+        connection.execute(
+            "INSERT INTO login_attempts(username,remote_ip,created_at) VALUES(?,?,?)",
+            (identity, remote_ip, now),
+        )
+        connection.commit(); connection.close()
         raise HTTPException(401, "Invalid username or password")
+    connection.execute("DELETE FROM login_attempts WHERE username=? AND remote_ip=?", (identity, remote_ip))
     token, expires_at = _create_session(connection, row["id"])
     connection.execute("INSERT INTO user_events(user_id,event_type,created_at) VALUES(?,?,?)", (row["id"], "login", time.time()))
     connection.commit(); connection.close()
@@ -240,6 +277,33 @@ def change_password(request: Request, payload: dict[str, Any]):
     response = JSONResponse({"user": {**request.state.user, "must_change_password": False}})
     _set_session_cookie(response, token, expires_at)
     return response
+
+
+
+SHORTCUT_ACTIONS = {"previous", "next", "bbox", "segment", "skeleton", "cuboid", "close_editor", "create_center", "zoom_in", "zoom_out", "prelabel", "save", "delete", "undo", "redo"}
+
+
+@router.get("/api/preferences")
+def get_preferences(request: Request):
+    connection = db(); row = connection.execute("SELECT shortcuts FROM user_preferences WHERE user_id=?", (request.state.user["id"],)).fetchone(); connection.close()
+    try: shortcuts = json.loads(row["shortcuts"]) if row else {}
+    except (TypeError, json.JSONDecodeError): shortcuts = {}
+    return {"shortcuts": shortcuts}
+
+
+@router.put("/api/preferences")
+def update_preferences(request: Request, payload: dict[str, Any]):
+    raw = payload.get("shortcuts")
+    if not isinstance(raw, dict): raise HTTPException(422, "shortcuts must be an object")
+    shortcuts = {}
+    for action, shortcut in raw.items():
+        if action not in SHORTCUT_ACTIONS: raise HTTPException(422, f"Unknown shortcut action: {action}")
+        value = str(shortcut).strip()[:64]
+        if value: shortcuts[action] = value
+    folded = [value.casefold() for value in shortcuts.values()]
+    if len(folded) != len(set(folded)): raise HTTPException(409, "Shortcut keys must be unique")
+    connection = db(); connection.execute("INSERT INTO user_preferences(user_id,shortcuts,updated_at) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET shortcuts=excluded.shortcuts,updated_at=excluded.updated_at", (request.state.user["id"], json.dumps(shortcuts, ensure_ascii=False), time.time())); connection.commit(); connection.close()
+    return {"shortcuts": shortcuts}
 
 
 def record_image_open(user_id: str, image_id: str) -> None:
